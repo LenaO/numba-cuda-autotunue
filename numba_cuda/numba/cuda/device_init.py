@@ -78,6 +78,7 @@ from numba.cuda import initialize
 from .errors import KernelRuntimeError
 
 from .decorators import jit, declare_device
+from .autotune import jit_autotune, AutotuneDispatcher
 from .api import *
 from .api import _auto_device
 from .args import In, Out, InOut
