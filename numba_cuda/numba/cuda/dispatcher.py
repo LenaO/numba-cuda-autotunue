@@ -505,7 +505,16 @@ class _Kernel(serialize.ReduceMixin):
             cooperative_launch=self.cooperative,
         )
         kernel = cufunc.kernel
-        launch(stream, config, kernel, *kernelargs)
+        try:
+            launch(stream, config, kernel, *kernelargs)
+        except ValueError as e:
+            # cuda.core raises ValueError when the cooperative-launch grid
+            # exceeds the SM limit.  Re-raise as CudaAPIError so callers
+            # that gate on CudaAPIError (e.g. gamdpy's JIT_and_test_kernel)
+            # can handle the failure gracefully.
+            if self.cooperative and "grid size" in str(e).lower():
+                raise driver.CudaAPIError(1, str(e)) from e
+            raise
 
         if self.debug:
             driver.device_to_host(ctypes.addressof(excval), excmem, excsz)

@@ -225,6 +225,62 @@ class CacheManager:
 # ---------------------------------------------------------------------------
 
 
+def _collect_device_fn_sources(py_func, clean_src: str) -> list[tuple[str, str]]:
+    """Return ``[(name, clean_source), ...]`` for all CUDA device functions
+    reachable from *clean_src*, in dependency order (deepest first).
+
+    Walks the AST of *clean_src* looking for simple ``Name`` call targets.
+    For each name that resolves in *py_func.__globals__* to a
+    ``CUDADispatcher`` with ``device=True``, retrieves the source via
+    ``inspect.getsource`` and recurses into it.
+
+    Device functions whose source cannot be retrieved are silently skipped;
+    the pre-compiled dispatcher already in ``func.__globals__`` is used as a
+    fallback at build time.
+    """
+    from numba.cuda.dispatcher import CUDADispatcher
+
+    globs = py_func.__globals__
+
+    def _called_names(src: str) -> set[str]:
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return set()
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                names.add(node.func.id)
+        return names
+
+    def _is_device_dispatcher(obj) -> bool:
+        return (
+            isinstance(obj, CUDADispatcher)
+            and bool(obj.targetoptions.get("device", False))
+        )
+
+    def _collect(src: str, visited: set[str]) -> list[tuple[str, str]]:
+        """Depth-first; returns (name, clean_src) pairs, deepest first."""
+        result: list[tuple[str, str]] = []
+        for name in _called_names(src):
+            if name in visited:
+                continue
+            obj = globs.get(name)
+            if not _is_device_dispatcher(obj):
+                continue
+            visited.add(name)
+            try:
+                raw = inspect.getsource(obj.py_func)
+                dev_clean = _strip_decorators(raw)
+            except (OSError, TypeError):
+                continue
+            result.extend(_collect(dev_clean, visited))
+            result.append((name, dev_clean))
+        return result
+
+    return _collect(clean_src, set())
+
+
 def _strip_decorators(src: str) -> str:
     """Return *src* with every decorator stripped from all function defs."""
     src = textwrap.dedent(src)
@@ -260,14 +316,37 @@ def _apply_transform(clean_src: str, cfg: dict) -> str | None:
 
 
 def _build_dispatcher(src: str, func_name: str, user_globals: dict,
-                      jit_kwargs: dict):
-    """``exec()`` *src* and wrap the result in a ``cuda.jit`` dispatcher."""
+                      jit_kwargs: dict,
+                      device_fn_srcs: list[tuple[str, str]] = ()):
+    """``exec()`` *src* and wrap the result in a ``cuda.jit`` dispatcher.
+
+    If *device_fn_srcs* is provided (list of ``(name, transformed_src)``
+    pairs in dependency order), each device function is exec'd, immediately
+    re-wrapped with ``cuda.jit(device=True)``, and injected into the exec
+    namespace before the global kernel source is compiled.  This ensures that
+    the uint32 transform is applied to device function bodies as well as the
+    outer kernel, and that Numba sees proper ``CUDADispatcher`` objects (not
+    bare Python functions) at the call sites.
+    """
     import numba as _nb
     from numba import cuda as _cuda
 
     g: dict[str, Any] = dict(user_globals)
     g.setdefault("nb", _nb)
     g.setdefault("cuda", _cuda)
+
+    # Compile transformed device functions in dependency order and inject
+    # their dispatchers into g so the global kernel sees them correctly.
+    safe_dev = {k: v for k, v in jit_kwargs.items()
+                if k not in ("device",) and v is not None}
+    for dev_name, dev_src in device_fn_srcs:
+        try:
+            exec(compile(dev_src, "<jit_autotune_device>", "exec"), g)  # noqa: S102
+            dev_fn = g[dev_name]
+            g[dev_name] = _cuda.jit(device=True, **safe_dev)(dev_fn)
+        except Exception:
+            pass  # fall back to original dispatcher already in g from user_globals
+
     exec(compile(src, "<jit_autotune>", "exec"), g)  # noqa: S102
     fn = g[func_name]
     safe = {k: v for k, v in jit_kwargs.items()
@@ -480,6 +559,18 @@ class AutotuneDispatcher:
                 )
                 self._clean_src = None
 
+        # Collect sources of reachable CUDA device functions so the uint32
+        # transform can be applied to their bodies too (not just the outer
+        # kernel).  Stored as (name, clean_src) pairs in dependency order.
+        # When source= was supplied the caller owns the content, so we skip
+        # the automatic device-function walk in that case.
+        if self._clean_src is not None and source is None:
+            self._device_fn_sources: list[tuple[str, str]] = (
+                _collect_device_fn_sources(py_func, self._clean_src)
+            )
+        else:
+            self._device_fn_sources = []
+
         # Drop while-loop variants when the kernel has no range() call:
         # the while transform only rewrites range-based loops, so it would
         # produce an identical (or broken) kernel for range-free code.
@@ -581,7 +672,12 @@ class AutotuneDispatcher:
                         if k != "device" and v is not None}
                 disp = _cuda.jit(**safe)(self._py_func)
             else:
-                disp = _build_dispatcher(tsrc, fname, glo, self._jit_kwargs)
+                dev_srcs = [
+                    (n, _apply_transform(s, cfg) or s)
+                    for n, s in self._device_fn_sources
+                ]
+                disp = _build_dispatcher(tsrc, fname, glo, self._jit_kwargs,
+                                         dev_srcs)
             disp.compile(argtypes)
             disp.disable_compile()
             return disp
@@ -658,8 +754,13 @@ class AutotuneDispatcher:
                             if k != "device" and v is not None}
                     disp = _cuda.jit(**safe)(self._py_func)
                 else:
+                    # Apply the same transform to each device function source
+                    dev_srcs = [
+                        (n, _apply_transform(s, cfg) or s)
+                        for n, s in self._device_fn_sources
+                    ]
                     disp = _build_dispatcher(tsrc, fname, glo,
-                                             self._jit_kwargs)
+                                             self._jit_kwargs, dev_srcs)
             except Exception as exc:
                 if self._verbose:
                     print(f"  {vname:<24} SKIP  (build: {exc})")
