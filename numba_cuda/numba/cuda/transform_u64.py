@@ -45,6 +45,10 @@ class _NonNegCollector(ast.NodeVisitor):
 
     def __init__(self, seeds: "set[str] | None" = None) -> None:
         self.non_neg: set[str] = set(seeds) if seeds else set()
+        # Variables that are EVER assigned a value that is not provably non-neg.
+        # These must be excluded from the cast set even if they were also
+        # assigned a non-negative value in another branch.
+        self.conditionally_negative: set[str] = set()
 
     # ------------------------------------------------------------------
     # Predicates
@@ -85,10 +89,9 @@ class _NonNegCollector(ast.NodeVisitor):
                 return True
             if isinstance(func, ast.Name) and func.id in self._UNSIGNED_TYPES:
                 return True
-            # cuda.grid() returns are handled via the assignment visitor,
-            # but recognise the call itself as non-neg for completeness.
+            # cuda.grid() and cuda.gridsize() always return non-negative values.
             if (isinstance(func, ast.Attribute)
-                    and func.attr == "grid"
+                    and func.attr in ("grid", "gridsize")
                     and isinstance(func.value, ast.Name)
                     and func.value.id == "cuda"):
                 return True
@@ -122,16 +125,24 @@ class _NonNegCollector(ast.NodeVisitor):
             return
         target = node.targets[0]
 
-        # x, y = cuda.grid(2)  — all tuple elements are non-negative
-        if isinstance(target, ast.Tuple) and self._is_cuda_grid_call(node.value):
+        # x, y = cuda.grid(2)  /  gx, gy = cuda.gridsize(2)  — all non-negative
+        if isinstance(target, ast.Tuple) and (
+            self._is_cuda_grid_call(node.value) or self._is_non_neg_expr(node.value)
+        ):
             for elt in target.elts:
                 if isinstance(elt, ast.Name):
                     self.non_neg.add(elt.id)
             return
 
-        # VAR = <non-neg-expr>
-        if isinstance(target, ast.Name) and self._is_non_neg_expr(node.value):
-            self.non_neg.add(target.id)
+        # VAR = <non-neg-expr> or VAR = <possibly-negative-expr>
+        if isinstance(target, ast.Name):
+            if self._is_non_neg_expr(node.value):
+                self.non_neg.add(target.id)
+            else:
+                # This assignment may produce a negative value.  Mark the
+                # variable so it is excluded from the cast set even if another
+                # branch assigns it a non-negative value.
+                self.conditionally_negative.add(target.id)
 
         self.generic_visit(node)
 
@@ -260,7 +271,7 @@ class _U64Transformer(ast.NodeTransformer):
             if isinstance(func, ast.Name) and func.id in self._UNSIGNED_TYPES:
                 return True
             if (isinstance(func, ast.Attribute)
-                    and func.attr == "grid"
+                    and func.attr in ("grid", "gridsize")
                     and isinstance(func.value, ast.Name)
                     and func.value.id == "cuda"):
                 return True
@@ -904,9 +915,15 @@ class U64FunctionTransformer(ast.NodeTransformer):
         # Pass 1b: remove variables that appear on the RHS of subtraction or
         # inside unary negation — casting them to unsigned would wrap/underflow
         # (e.g. ``1 - row`` or ``-row * 2`` with row typed as uint32).
+        # Also remove variables that were ever assigned a possibly-negative
+        # value in any branch (conditionally_negative), since casting them
+        # would wrap to a huge positive index in the branch where they are
+        # negative (e.g. donor=-1 cast to uint32 gives 4,294,967,295).
         sign_finder = _SignSensitiveFinder(collector.non_neg)
         sign_finder.visit(node)
-        safe_non_neg = collector.non_neg - sign_finder.sign_sensitive
+        safe_non_neg = (collector.non_neg
+                        - sign_finder.sign_sensitive
+                        - collector.conditionally_negative)
 
         # Pass 2 (optional): hoist BinOp index expressions out of subscript
         # brackets before the uint transformation so that introduced temporaries
@@ -923,7 +940,9 @@ class U64FunctionTransformer(ast.NodeTransformer):
             collector.visit(node)
             sign_finder = _SignSensitiveFinder(collector.non_neg)
             sign_finder.visit(node)
-            safe_non_neg = collector.non_neg - sign_finder.sign_sensitive
+            safe_non_neg = (collector.non_neg
+                            - sign_finder.sign_sensitive
+                            - collector.conditionally_negative)
 
         # Pass 3: rewrite the function body with uint casts.
         transformer = _U64Transformer(

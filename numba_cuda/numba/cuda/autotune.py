@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-2-Clause
-"""cuda.jit_autotune – automatic uint32-transform variant selection.
+"""cuda.jit_autotune – automatic uint32-transform variant selection with caching.
 
 On the *first* call to a decorated kernel, four variants are compiled and
 timed with CUDA events:
@@ -15,28 +15,44 @@ only as a fallback when the transform itself raises an exception.
 
 The winning variant is used for **all subsequent calls** at zero overhead.
 
+Caching
+-------
+Pass ``cache=True`` (or a directory path) to persist the tuning decision to
+disk.  The cache key combines:
+
+* An MD5 fingerprint of the argument types (ensures type-correct reuse).
+* An **occupancy bucket**: ``floor(log2(total_threads / GPU_capacity))``,
+  clamped to ``[-3, 6]``.  This coarsely captures the utilization regime
+  (under-occupied vs. fully occupied) that drives which variant wins.
+* A fingerprint of the stripped kernel source (cache auto-invalidates when
+  the kernel body changes).
+
+On a cache *hit* only the winning variant is compiled (saving 1-3 compilation
+steps), but benchmarking is skipped entirely.
+
 Example::
 
     from numba import cuda
 
-    @cuda.jit_autotune
-    def saxpy(a, x, y, n):
-        i = cuda.grid(1)
-        if i < n:
-            y[i] += a * x[i]
+    @cuda.jit_autotune(cache=True)
+    def spmv(data, indices, indptr, x, y, n):
+        ...
 
-    saxpy[blocks, threads](a_d, x_d, y_d, n)   # autotuned on first call
-    saxpy[blocks, threads](a_d, x_d, y_d, n)   # winner used directly
-
-Keyword arguments (``debug``, ``opt``, ``fastmath``, …) are forwarded to
-``cuda.jit()`` and apply to *all* compiled variants.
+    spmv[blocks, tpb](...)   # tunes on first call, writes cache
+    # restart program
+    spmv[blocks, tpb](...)   # cache hit: compiles winner only, no benchmark
 """
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
+import json
+import math
 import textwrap
 import warnings
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from numba.cuda.transform_u64 import transform_source_u64
@@ -62,7 +78,150 @@ AUTOTUNE_WARMUP: int = 3
 AUTOTUNE_REPS:   int = 10
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+
+def _argtypes_fingerprint(argtypes: tuple) -> str:
+    """12-hex-char MD5 of the string representation of *argtypes*."""
+    return hashlib.md5(str(argtypes).encode()).hexdigest()[:12]
+
+
+def _occupancy_bucket(griddim, blockdim) -> int:
+    """Return an integer bucket in ``[-3, 6]`` representing GPU utilisation.
+
+    Bucket 0  ≈ exactly one SM-wave of threads.
+    Negative  = under-occupied; positive = over-occupied (many waves).
+    """
+    from numba import cuda as _cuda
+
+    def _prod(x) -> int:
+        if isinstance(x, int):
+            return x
+        r = 1
+        for v in x:
+            r *= v
+        return r
+
+    total = _prod(griddim) * _prod(blockdim)
+    device = _cuda.get_current_device()
+    # 2048 threads/SM is the Ada/Ampere/Hopper architectural maximum
+    capacity = device.MULTIPROCESSOR_COUNT * 2048
+    ratio = total / max(capacity, 1)
+    return max(-3, min(6, int(math.floor(math.log2(max(ratio, 1e-9))))))
+
+
+class CacheManager:
+    """Persist and retrieve autotune decisions for one kernel on one device.
+
+    The cache file is a human-readable JSON document stored at::
+
+        <cache_dir>/<func_name>_<device_id8>.json
+
+    The root-level ``source_hash`` field holds an MD5 of the stripped kernel
+    source; the entire file is discarded and rebuilt whenever the source
+    changes.
+
+    Each entry is keyed by ``"<argtypes_fp>|<bucket>"`` and stores the
+    winner name, full timing table, an example launch config, and a
+    timestamp.
+    """
+
+    def __init__(self, func_name: str, clean_src: str | None,
+                 cache_dir: str | Path = ".autotune_cache") -> None:
+        from numba import cuda as _cuda
+
+        self._func_name   = func_name
+        self._source_hash = (
+            hashlib.md5(clean_src.encode()).hexdigest()[:16]
+            if clean_src else ""
+        )
+
+        device = _cuda.get_current_device()
+        device_name = device.name.decode() if isinstance(device.name, bytes) \
+                      else str(device.name)
+        self._device_name = device_name
+        # Stable 8-char device identifier derived from the device name
+        self._device_id   = hashlib.md5(device_name.encode()).hexdigest()[:8]
+        cc                = device.compute_capability
+        self._cc          = f"{cc[0]}.{cc[1]}"
+
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        self._path = cache_dir / f"{func_name}_{self._device_id}.json"
+        self._data = self._load()
+
+    # ── I/O ───────────────────────────────────────────────────────────────
+
+    def _fresh(self) -> dict:
+        return {
+            "func":        self._func_name,
+            "source_hash": self._source_hash,
+            "device":      self._device_name,
+            "cc":          self._cc,
+            "entries":     {},
+        }
+
+    def _load(self) -> dict:
+        if self._path.exists():
+            try:
+                with open(self._path, encoding="utf-8") as f:
+                    data = json.load(f)
+                # Invalidate cache when kernel source has changed
+                if data.get("source_hash") != self._source_hash:
+                    warnings.warn(
+                        f"jit_autotune: source of {self._func_name!r} changed "
+                        f"– discarding cache {self._path}",
+                        stacklevel=5,
+                    )
+                    return self._fresh()
+                return data
+            except Exception as exc:
+                warnings.warn(
+                    f"jit_autotune: could not read cache {self._path}: {exc}",
+                    stacklevel=5,
+                )
+        return self._fresh()
+
+    def _save(self) -> None:
+        try:
+            with open(self._path, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, indent=2)
+        except Exception as exc:
+            warnings.warn(
+                f"jit_autotune: could not write cache {self._path}: {exc}",
+                stacklevel=5,
+            )
+
+    # ── public API ────────────────────────────────────────────────────────
+
+    def lookup(self, argtypes_fp: str, bucket: int) -> dict | None:
+        """Return the cached entry for *(argtypes_fp, bucket)*, or ``None``."""
+        return self._data["entries"].get(f"{argtypes_fp}|{bucket}")
+
+    def store(self, argtypes_fp: str, bucket: int, winner: str,
+              timing_ms: list[tuple[str, float]], griddim, blockdim) -> None:
+        """Persist a new tuning result and flush to disk."""
+        def _to_list(x):
+            return list(x) if hasattr(x, "__iter__") else [x]
+
+        key = f"{argtypes_fp}|{bucket}"
+        self._data["entries"][key] = {
+            "winner":          winner,
+            "timing_ms":       [[n, ms] for n, ms in timing_ms],
+            "griddim_example": _to_list(griddim),
+            "blockdim":        _to_list(blockdim),
+            "tuned_at":        datetime.now().isoformat(),
+        }
+        self._save()
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+
+# ---------------------------------------------------------------------------
+# Kernel-building helpers
 # ---------------------------------------------------------------------------
 
 
@@ -102,12 +261,7 @@ def _apply_transform(clean_src: str, cfg: dict) -> str | None:
 
 def _build_dispatcher(src: str, func_name: str, user_globals: dict,
                       jit_kwargs: dict):
-    """``exec()`` *src* and wrap the result in a ``cuda.jit`` dispatcher.
-
-    A shallow copy of *user_globals* is used as the exec namespace so that all
-    symbols the original function references are available.  ``nb`` and
-    ``cuda`` are injected in case the transformed source references them.
-    """
+    """``exec()`` *src* and wrap the result in a ``cuda.jit`` dispatcher."""
     import numba as _nb
     from numba import cuda as _cuda
 
@@ -116,25 +270,96 @@ def _build_dispatcher(src: str, func_name: str, user_globals: dict,
     g.setdefault("cuda", _cuda)
     exec(compile(src, "<jit_autotune>", "exec"), g)  # noqa: S102
     fn = g[func_name]
-    # Strip keys that are not valid for kernel (non-device) jit
     safe = {k: v for k, v in jit_kwargs.items()
             if k != "device" and v is not None}
     return _cuda.jit(**safe)(fn)
 
 
+def _has_range_loop(src: str) -> bool:
+    """Return True if *src* contains at least one ``range(`` call.
+
+    Used to skip while-loop variants for kernels that have no for-range loops
+    (the while transform only makes sense when there is a range to rewrite).
+    A simple text scan is sufficient – we are looking for the token ``range(``.
+    """
+    import ast
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return True  # be conservative: try all variants if parse fails
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if (isinstance(func, ast.Name) and func.id == "range") or (
+                isinstance(func, ast.Attribute) and func.attr == "range"
+            ):
+                return True
+    return False
+
+
+def _copy_args(args: tuple) -> tuple:
+    """Return a copy of *args* where every device/host array is duplicated.
+
+    Scalars are passed through unchanged.  This ensures that benchmarking
+    transformed variants never corrupts live application data.
+
+    Numba ``DeviceNDArray`` objects do NOT have a ``.copy()`` method; they
+    must be copied via ``copy_to_host()`` + ``cuda.to_device()``.
+    """
+    from numba import cuda as _cuda
+    from numba.cuda.cudadrv.devicearray import DeviceNDArray as _DeviceNDArray
+    import numpy as _np
+    result = []
+    for a in args:
+        if isinstance(a, _DeviceNDArray):
+            # D2H then H2D: reliable deep copy independent of CUDA stream state
+            result.append(_cuda.to_device(a.copy_to_host()))
+        elif isinstance(a, _np.ndarray):
+            result.append(a.copy())
+        else:
+            result.append(a)
+    return tuple(result)
+
+
+class _FatalCUDAError(RuntimeError):
+    """Raised when a CUDA context-fatal error occurs during benchmarking.
+
+    Unlike ordinary launch failures (wrong args, compile errors, etc.),
+    context-fatal errors (ILLEGAL_ADDRESS, CONTEXT_IS_DESTROYED, …) make
+    every subsequent CUDA call fail.  Callers must stop benchmarking and
+    not attempt any further CUDA work in the same process.
+    """
+
+
+_FATAL_CUDA_SUBSTRINGS = (
+    "ILLEGAL_ADDRESS",
+    "CONTEXT_IS_DESTROYED",
+    "ILLEGAL_INSTRUCTION",
+    "MISALIGNED_ADDRESS",
+)
+
+
+def _is_fatal_cuda_error(exc: BaseException) -> bool:
+    msg = str(exc)
+    return any(s in msg for s in _FATAL_CUDA_SUBSTRINGS)
+
+
 def _bench_variant(disp, argtypes: tuple, griddim, blockdim, stream,
                    sharedmem, args: tuple,
                    warmup: int, reps: int) -> tuple[float | None, str | None]:
-    """Compile, warm-up, and time *disp* for *argtypes*.
+    """Compile, warm-up, and time *disp*.  Returns ``(ms, None)`` or
+    ``(None, reason)``.
 
-    Returns ``(ms_per_launch, None)`` on success or ``(None, reason)`` on
-    any error.
+    Raises :class:`_FatalCUDAError` if the CUDA context is poisoned by the
+    variant under test so the caller can abort benchmarking immediately.
     """
     from numba import cuda as _cuda
 
     try:
         disp.compile(argtypes)
     except Exception as exc:
+        if _is_fatal_cuda_error(exc):
+            raise _FatalCUDAError(str(exc)) from exc
         return None, f"compile error: {exc}"
     disp.disable_compile()
 
@@ -152,6 +377,8 @@ def _bench_variant(disp, argtypes: tuple, griddim, blockdim, stream,
         t1.synchronize()
         return _cuda.event_elapsed_time(t0, t1) / reps, None
     except Exception as exc:
+        if _is_fatal_cuda_error(exc):
+            raise _FatalCUDAError(str(exc)) from exc
         return None, f"launch error: {exc}"
 
 
@@ -163,8 +390,8 @@ def _bench_variant(disp, argtypes: tuple, griddim, blockdim, stream,
 class _AutotuneLaunchConfig:
     """Returned by ``AutotuneDispatcher.__getitem__``.
 
-    Triggers autotuning on the very first ``__call__``, then delegates to
-    the winning variant's launch configuration.
+    Triggers autotuning (or a cache-assisted fast path) on the very first
+    ``__call__``, then delegates to the winning variant's launch configuration.
     """
     __slots__ = ("_owner", "_griddim", "_blockdim", "_stream", "_sharedmem")
 
@@ -187,17 +414,24 @@ class _AutotuneLaunchConfig:
 
 
 class AutotuneDispatcher:
-    """Wraps a CUDA kernel and benchmarks uint32 variants on the first call.
+    """Wraps a CUDA kernel; benchmarks uint32 variants on first call and
+    uses the fastest for every subsequent call.
 
-    After the first launch the winning ``CUDADispatcher`` is stored and all
-    subsequent calls are routed to it with no extra overhead.
+    When *cache* is enabled, the winning variant for each
+    ``(argtypes, occupancy_bucket)`` combination is saved to a JSON file and
+    reloaded on the next run, skipping benchmarking entirely.
 
     Attributes
     ----------
     winner : str | None
         Name of the winning variant (available after the first call).
     tuned : bool
-        ``True`` after autotuning has completed.
+        ``True`` after autotuning (or a cache hit) has completed.
+    timing_results : list[tuple[str, float]]
+        Per-variant ``(name, ms)`` from the last full benchmark run.
+        Empty on a cache hit where benchmarking was skipped.
+    cache_path : Path | None
+        Path to the JSON cache file, or ``None`` if caching is disabled.
     """
 
     def __init__(
@@ -205,36 +439,55 @@ class AutotuneDispatcher:
         py_func,
         jit_kwargs: dict,
         *,
-        variants: list[dict] | None = None,
-        warmup:   int  = AUTOTUNE_WARMUP,
-        reps:     int  = AUTOTUNE_REPS,
-        verbose:  bool = True,
+        variants:        list[dict] | None = None,
+        warmup:          int  = AUTOTUNE_WARMUP,
+        reps:            int  = AUTOTUNE_REPS,
+        verbose:         bool = True,
+        cache:           bool | str | Path = False,
+        bench_with_copy: bool = False,
+        source:          str | None = None,
     ) -> None:
-        self._py_func    = py_func
-        self._jit_kwargs = jit_kwargs
-        self._variants   = variants if variants is not None else DEFAULT_VARIANTS
-        self._warmup     = warmup
-        self._reps       = reps
-        self._verbose    = verbose
-        self._tuned          = False
-        self._winner: Any        = None
-        self._winner_name: str | None = None
+        self._py_func        = py_func
+        self._jit_kwargs     = jit_kwargs
+        self._variants       = variants if variants is not None else DEFAULT_VARIANTS
+        self._warmup         = warmup
+        self._reps           = reps
+        self._verbose        = verbose
+        self._cache_arg      = cache      # stored; CacheManager created lazily
+        self._bench_with_copy = bench_with_copy
+
+        self._tuned                               = False
+        self._winner: Any                         = None
+        self._winner_name: str | None             = None
         self._timing_results: list[tuple[str, float]] = []
+        self._cache_mgr: CacheManager | None      = None
 
         # Extract decorator-free source eagerly while the module context is
         # still available (inspect.getsource fails for exec'd functions).
-        try:
-            self._clean_src: str | None = _strip_decorators(
-                inspect.getsource(py_func)
-            )
-        except (OSError, TypeError) as exc:
-            warnings.warn(
-                f"jit_autotune: cannot read source for "
-                f"{py_func.__name__!r}: {exc}. "
-                "Only the 'original' variant will be benchmarked.",
-                stacklevel=3,
-            )
-            self._clean_src = None
+        # A caller may supply the source directly via the *source* parameter
+        # (e.g. when the function was created via exec()).
+        if source is not None:
+            self._clean_src: str | None = _strip_decorators(source)
+        else:
+            try:
+                self._clean_src = _strip_decorators(inspect.getsource(py_func))
+            except (OSError, TypeError) as exc:
+                warnings.warn(
+                    f"jit_autotune: cannot read source for "
+                    f"{py_func.__name__!r}: {exc}. "
+                    "Only the 'original' variant will be benchmarked.",
+                    stacklevel=3,
+                )
+                self._clean_src = None
+
+        # Drop while-loop variants when the kernel has no range() call:
+        # the while transform only rewrites range-based loops, so it would
+        # produce an identical (or broken) kernel for range-free code.
+        if self._clean_src is not None and not _has_range_loop(self._clean_src):
+            self._variants = [
+                v for v in self._variants
+                if not (v.get("transform") and v.get("mode") == "while")
+            ]
 
     # ── public interface (mirrors CUDADispatcher) ──────────────────────────
 
@@ -267,48 +520,131 @@ class AutotuneDispatcher:
 
     @property
     def winner(self) -> str | None:
-        """Name of the winning variant, or ``None`` if not yet tuned."""
         return self._winner_name
 
     @property
     def tuned(self) -> bool:
-        """``True`` after the first call has triggered autotuning."""
         return self._tuned
 
     @property
     def timing_results(self) -> list[tuple[str, float]]:
-        """List of ``(variant_name, ms)`` for every variant that compiled and
-        ran successfully.  Available after the first call; empty before."""
+        """Per-variant ``(name, ms)`` from the last benchmark. Empty on cache
+        hit (benchmarking was skipped)."""
         return self._timing_results
+
+    @property
+    def cache_path(self) -> Path | None:
+        return self._cache_mgr.path if self._cache_mgr else None
+
+    # ── internal ──────────────────────────────────────────────────────────
+
+    def _get_cache_mgr(self) -> CacheManager | None:
+        """Create CacheManager on first use (CUDA must already be initialised)."""
+        if self._cache_mgr is not None or not self._cache_arg:
+            return self._cache_mgr
+        cache_dir = (
+            ".autotune_cache"
+            if self._cache_arg is True
+            else self._cache_arg
+        )
+        try:
+            self._cache_mgr = CacheManager(
+                self._py_func.__name__, self._clean_src, cache_dir
+            )
+        except Exception as exc:
+            warnings.warn(f"jit_autotune: cache disabled ({exc})", stacklevel=4)
+        return self._cache_mgr
+
+    def _compile_variant(self, vname: str, fname: str,
+                         glo: dict, argtypes: tuple):
+        """Build + compile a single named variant.  Returns the dispatcher or
+        ``None`` on any error."""
+        from numba import cuda as _cuda
+
+        cfg = next((c for c in self._variants if c["name"] == vname), None)
+        if cfg is None:
+            return None
+
+        if self._clean_src is not None:
+            tsrc = _apply_transform(self._clean_src, cfg)
+        elif not cfg.get("transform"):
+            tsrc = None
+        else:
+            return None
+
+        if tsrc is None and cfg.get("transform"):
+            return None
+
+        try:
+            if not cfg["transform"]:
+                safe = {k: v for k, v in self._jit_kwargs.items()
+                        if k != "device" and v is not None}
+                disp = _cuda.jit(**safe)(self._py_func)
+            else:
+                disp = _build_dispatcher(tsrc, fname, glo, self._jit_kwargs)
+            disp.compile(argtypes)
+            disp.disable_compile()
+            return disp
+        except Exception:
+            return None
 
     # ── autotuning core ───────────────────────────────────────────────────
 
     def _autotune(self, args: tuple, griddim, blockdim, stream,
                   sharedmem) -> None:
-        """Benchmark all variants and store the winner."""
         from numba import cuda as _cuda, typeof
 
         argtypes = tuple(typeof(a) for a in args)
         fname    = self._py_func.__name__
         glo      = self._py_func.__globals__
 
+        # Optionally benchmark on copies so live data is never corrupted
+        bench_args = _copy_args(args) if self._bench_with_copy else args
+
+        # ── cache lookup ─────────────────────────────────────────────────
+        mgr    = self._get_cache_mgr()
+        afp    = _argtypes_fingerprint(argtypes)
+        bucket = _occupancy_bucket(griddim, blockdim) if mgr else 0
+
+        if mgr is not None:
+            cached = mgr.lookup(afp, bucket)
+            if cached is not None:
+                vname = cached["winner"]
+                if self._verbose:
+                    print(f"\n[jit_autotune] Cache hit for {fname!r}  "
+                          f"(bucket={bucket:+d}, winner={vname!r})")
+                disp = self._compile_variant(vname, fname, glo, argtypes)
+                if disp is not None:
+                    self._winner        = disp
+                    self._winner_name   = vname
+                    self._timing_results = [
+                        (r[0], r[1]) for r in cached.get("timing_ms", [])
+                    ]
+                    self._tuned = True
+                    return
+                # Winner failed to rebuild – fall through to full retune
+                if self._verbose:
+                    print(f"  (cached winner {vname!r} failed to rebuild "
+                          f"– retuning)")
+
+        # ── full benchmark ────────────────────────────────────────────────
         if self._verbose:
-            print(f"\n[jit_autotune] Tuning {fname!r} …")
+            print(f"\n[jit_autotune] Tuning {fname!r}  (bucket={bucket:+d}) ...")
 
         results: list[tuple[str, Any, float]] = []
         base_ms: float | None = None
+        _fatal_error: _FatalCUDAError | None = None
 
         for cfg in self._variants:
             vname = cfg["name"]
 
-            # ── build transformed source ──
             if self._clean_src is not None:
                 tsrc = _apply_transform(self._clean_src, cfg)
             elif not cfg["transform"]:
-                tsrc = None          # use py_func directly (original)
+                tsrc = None
             else:
                 if self._verbose:
-                    print(f"  {vname:<24} SKIP  (no source for transform)")
+                    print(f"  {vname:<24} SKIP  (no source)")
                 continue
 
             if tsrc is None and cfg["transform"]:
@@ -316,7 +652,6 @@ class AutotuneDispatcher:
                     print(f"  {vname:<24} SKIP  (transform raised)")
                 continue
 
-            # ── build dispatcher ──
             try:
                 if not cfg["transform"]:
                     safe = {k: v for k, v in self._jit_kwargs.items()
@@ -330,11 +665,17 @@ class AutotuneDispatcher:
                     print(f"  {vname:<24} SKIP  (build: {exc})")
                 continue
 
-            # ── compile & time ──
-            ms, err = _bench_variant(
-                disp, argtypes, griddim, blockdim, stream, sharedmem,
-                args, self._warmup, self._reps,
-            )
+            try:
+                ms, err = _bench_variant(
+                    disp, argtypes, griddim, blockdim, stream, sharedmem,
+                    bench_args, self._warmup, self._reps,
+                )
+            except _FatalCUDAError as exc:
+                if self._verbose:
+                    print(f"  {vname:<24} ABORT (fatal CUDA error: {exc})")
+                    print(f"  Stopping benchmark – CUDA context is poisoned.")
+                _fatal_error = exc
+                break  # stop trying more variants; use whatever we have so far
             if ms is None:
                 if self._verbose:
                     print(f"  {vname:<24} SKIP  ({err})")
@@ -350,19 +691,38 @@ class AutotuneDispatcher:
             results.append((vname, disp, ms))
 
         if not results:
+            if _fatal_error is not None:
+                raise RuntimeError(
+                    f"jit_autotune: CUDA context poisoned before any variant "
+                    f"of {fname!r} could be timed. Restart the process."
+                ) from _fatal_error
             raise RuntimeError(
-                f"jit_autotune: every variant failed for {fname!r}. "
-                "Ensure the kernel compiles with cuda.jit()."
+                f"jit_autotune: every variant failed for {fname!r}."
             )
 
         bname, bdisp, bms = min(results, key=lambda t: t[2])
+        timing = [(n, ms) for n, _, ms in results]
+
         if self._verbose:
             print(f"  => winner: {bname!r}  ({bms:.4f} ms)\n")
 
-        self._winner        = bdisp
-        self._winner_name   = bname
-        self._timing_results = [(n, ms) for n, _, ms in results]
-        self._tuned         = True
+        # ── cache store ───────────────────────────────────────────────────
+        if mgr is not None:
+            mgr.store(afp, bucket, bname, timing, griddim, blockdim)
+            if self._verbose:
+                print(f"  [cache] saved to {mgr.path}")
+
+        self._winner         = bdisp
+        self._winner_name    = bname
+        self._timing_results = timing
+        self._tuned          = True
+
+        if _fatal_error is not None:
+            raise RuntimeError(
+                f"jit_autotune: CUDA context poisoned while benchmarking "
+                f"{fname!r} (winner {bname!r} cached for next run). "
+                f"Restart the process to continue."
+            ) from _fatal_error
 
 
 # ---------------------------------------------------------------------------
@@ -378,15 +738,18 @@ def jit_autotune(
     reps:     int        = AUTOTUNE_REPS,
     variants: list | None = None,
     verbose:  bool       = True,
+    cache:    bool | str | Path = False,
+    bench_with_copy: bool = False,
+    source: str | None = None,
     # cuda.jit pass-through options
-    debug:          bool | None = None,
-    opt:            bool  = True,
-    fastmath:       bool  = False,
-    lineinfo:       bool  = False,
-    link:           tuple = (),
-    launch_bounds         = None,
-    lto:            bool  = False,
-    max_registers:  int | None = None,
+    debug:         bool | None = None,
+    opt:           bool  = True,
+    fastmath:      bool  = False,
+    lineinfo:      bool  = False,
+    link:          tuple = (),
+    launch_bounds        = None,
+    lto:           bool  = False,
+    max_registers: int | None = None,
     **extra_jit_kwargs,
 ) -> "AutotuneDispatcher":
     """Decorator – compile & benchmark uint32 variants; use the fastest.
@@ -396,7 +759,7 @@ def jit_autotune(
         @cuda.jit_autotune
         def kernel(...): ...
 
-        @cuda.jit_autotune(fastmath=True, reps=20)
+        @cuda.jit_autotune(cache=True, fastmath=True, reps=20)
         def kernel(...): ...
 
     Parameters
@@ -406,11 +769,16 @@ def jit_autotune(
     reps : int
         Timed launches per variant (default 10).
     variants : list[dict] | None
-        Override :data:`DEFAULT_VARIANTS`.  Each dict must contain at least
-        ``name`` and ``transform`` keys, and – when ``transform=True`` –
-        ``mode``, ``multistep``, ``dtype``, and optionally ``unroll``.
+        Override :data:`DEFAULT_VARIANTS`.
     verbose : bool
         Print per-variant timing and the chosen winner.
+    cache : bool | str | Path
+        ``False``  – no caching (default).
+        ``True``   – cache in ``.autotune_cache/`` next to the working dir.
+        ``"path"`` – cache in the given directory.
+    bench_with_copy : bool
+        If ``True``, device arrays are copied before benchmarking each variant
+        so that live simulation data is not corrupted by transformed kernels.
     debug, opt, fastmath, lineinfo, link, launch_bounds, lto, max_registers :
         Forwarded verbatim to ``cuda.jit()``.
     """
@@ -430,6 +798,9 @@ def jit_autotune(
             warmup=warmup,
             reps=reps,
             verbose=verbose,
+            cache=cache,
+            bench_with_copy=bench_with_copy,
+            source=source,
         )
 
     if func is not None:          # @jit_autotune  (no parentheses)
